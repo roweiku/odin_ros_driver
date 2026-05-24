@@ -71,6 +71,10 @@ enum class OdometryType {
 extern int g_log_level;
 extern int g_sendcloudrender;
 extern int g_use_host_ros_time;
+extern int g_custom_map_mode;
+extern bool g_relocalization_success_msg_printed;
+extern Eigen::Matrix4d g_map_calibration_transform;
+extern bool g_map_calibration_valid;
 double get_ptp_smoothed_delay();
 double get_ptp_smoothed_offset();
 #ifdef ROS2
@@ -1286,6 +1290,21 @@ void publishRgb(capture_Image_List_t *stream) {
                         transformStamped.transform.rotation.w = msg.pose.pose.orientation.w;
                         tf_broadcaster->sendTransform(transformStamped);
                     }
+                    // Mode 2: publish map→odom Identity before relocalization success
+                    if (g_custom_map_mode == 2 && !g_relocalization_success_msg_printed) {
+                        geometry_msgs::msg::TransformStamped mapOdomTf;
+                        mapOdomTf.header.stamp = msg.header.stamp;
+                        mapOdomTf.header.frame_id = "map";
+                        mapOdomTf.child_frame_id = "odom";
+                        mapOdomTf.transform.translation.x = 0.0;
+                        mapOdomTf.transform.translation.y = 0.0;
+                        mapOdomTf.transform.translation.z = 0.0;
+                        mapOdomTf.transform.rotation.x = 0.0;
+                        mapOdomTf.transform.rotation.y = 0.0;
+                        mapOdomTf.transform.rotation.z = 0.0;
+                        mapOdomTf.transform.rotation.w = 1.0;
+                        tf_broadcaster->sendTransform(mapOdomTf);
+                    }
                     odom_publisher_->publish(msg);
 
                     // Publish odom trajectory as visualization markers (green lines connecting adjacent points)
@@ -1349,17 +1368,47 @@ void publishRgb(capture_Image_List_t *stream) {
                     break;
                 case OdometryType::TRANSFORM:
                     {
+                    // Device sends odom→device_map. Invert to map→odom (ROS standard).
+                    // With calibration: T_map_odom = T_calibration * inv(T_odom_device_map)
                     geometry_msgs::msg::TransformStamped transformStamped;
                     transformStamped.header.stamp = msg.header.stamp;
-                    transformStamped.header.frame_id = "odom";
-                    transformStamped.child_frame_id = "map";
-                    transformStamped.transform.translation.x = msg.pose.pose.position.x;
-                    transformStamped.transform.translation.y = msg.pose.pose.position.y;
-                    transformStamped.transform.translation.z = msg.pose.pose.position.z;
-                    transformStamped.transform.rotation.x = msg.pose.pose.orientation.x;
-                    transformStamped.transform.rotation.y = msg.pose.pose.orientation.y;
-                    transformStamped.transform.rotation.z = msg.pose.pose.orientation.z;
-                    transformStamped.transform.rotation.w = msg.pose.pose.orientation.w;
+                    transformStamped.header.frame_id = "map";
+                    transformStamped.child_frame_id = "odom";
+
+                    Eigen::Quaterniond q_dev(
+                        msg.pose.pose.orientation.w,
+                        msg.pose.pose.orientation.x,
+                        msg.pose.pose.orientation.y,
+                        msg.pose.pose.orientation.z);
+                    Eigen::Vector3d t_dev(
+                        msg.pose.pose.position.x,
+                        msg.pose.pose.position.y,
+                        msg.pose.pose.position.z);
+
+                    Eigen::Matrix4d T_odom_to_map = Eigen::Matrix4d::Identity();
+                    T_odom_to_map.block<3,3>(0,0) = q_dev.toRotationMatrix();
+                    T_odom_to_map.block<3,1>(0,3) = t_dev;
+
+                    // Invert: map→odom = inv(odom→map)
+                    Eigen::Matrix4d T_map_to_odom = T_odom_to_map.inverse();
+
+                    // Apply calibration correction if available
+                    if (g_map_calibration_valid) {
+                        T_map_to_odom = g_map_calibration_transform * T_map_to_odom;
+                    }
+
+                    Eigen::Vector3d t_result = T_map_to_odom.block<3,1>(0,3);
+                    Eigen::Matrix3d R_result = T_map_to_odom.block<3,3>(0,0);
+                    Eigen::Quaterniond q_result(R_result);
+                    q_result.normalize();
+
+                    transformStamped.transform.translation.x = t_result.x();
+                    transformStamped.transform.translation.y = t_result.y();
+                    transformStamped.transform.translation.z = t_result.z();
+                    transformStamped.transform.rotation.x = q_result.x();
+                    transformStamped.transform.rotation.y = q_result.y();
+                    transformStamped.transform.rotation.z = q_result.z();
+                    transformStamped.transform.rotation.w = q_result.w();
                     tf_broadcaster->sendTransform(transformStamped);
                     }
                     break;

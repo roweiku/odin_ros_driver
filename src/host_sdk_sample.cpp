@@ -158,6 +158,10 @@ FILE* dev_status_csv_file = nullptr;
 
 std::filesystem::path map_root_dir_;
 
+// Map calibration for mode 2 (relocalization)
+Eigen::Matrix4d g_map_calibration_transform = Eigen::Matrix4d::Identity();
+bool g_map_calibration_valid = false;
+
 char driver_start_time[32];
 
 typedef struct  {
@@ -166,6 +170,78 @@ typedef struct  {
     int count = 0;
     std::mutex fps_mutex;
 } fpsHandle;
+
+// Load map calibration from YAML file (mode 2 only)
+void loadMapCalibration() {
+    // Resolve config path from COLCON_PREFIX_PATH
+    const char* prefix_path = std::getenv("COLCON_PREFIX_PATH");
+    if (!prefix_path) {
+        #ifdef ROS2
+        RCLCPP_WARN(rclcpp::get_logger("calibration"), "COLCON_PREFIX_PATH not set, skipping calibration");
+        #endif
+        return;
+    }
+
+    std::filesystem::path src_dir(prefix_path);
+    // Strip /install suffix to get workspace root, then append source path
+    if (src_dir.filename() == "install") {
+        src_dir = src_dir.parent_path();
+    }
+    std::filesystem::path yaml_path = src_dir / "src" / "odin_ros_driver" / "config" / "map_calibration.yaml";
+
+    if (!std::filesystem::exists(yaml_path)) {
+        #ifdef ROS2
+        RCLCPP_INFO(rclcpp::get_logger("calibration"), "No calibration file: %s", yaml_path.c_str());
+        #endif
+        return;
+    }
+
+    try {
+        YAML::Node config = YAML::LoadFile(yaml_path.string());
+        if (!config["calibration_result"] || !config["calibration_result"]["valid"]) {
+            #ifdef ROS2
+            RCLCPP_INFO(rclcpp::get_logger("calibration"), "Calibration file found but no valid result");
+            #endif
+            return;
+        }
+
+        if (!config["calibration_result"]["valid"].as<bool>()) {
+            #ifdef ROS2
+            RCLCPP_INFO(rclcpp::get_logger("calibration"), "Calibration result marked invalid");
+            #endif
+            return;
+        }
+
+        auto matrix = config["calibration_result"]["transform_matrix"];
+        if (!matrix || matrix.size() != 4) {
+            #ifdef ROS2
+            RCLCPP_WARN(rclcpp::get_logger("calibration"), "Invalid transform_matrix format");
+            #endif
+            return;
+        }
+
+        for (int i = 0; i < 4; i++) {
+            if (!matrix[i] || matrix[i].size() != 4) {
+                #ifdef ROS2
+                RCLCPP_WARN(rclcpp::get_logger("calibration"), "Invalid transform_matrix row %d", i);
+                #endif
+                return;
+            }
+            for (int j = 0; j < 4; j++) {
+                g_map_calibration_transform(i, j) = matrix[i][j].as<double>();
+            }
+        }
+
+        g_map_calibration_valid = true;
+        #ifdef ROS2
+        RCLCPP_INFO(rclcpp::get_logger("calibration"), "Map calibration loaded successfully from %s", yaml_path.c_str());
+        #endif
+    } catch (const std::exception& e) {
+        #ifdef ROS2
+        RCLCPP_WARN(rclcpp::get_logger("calibration"), "Failed to load calibration: %s", e.what());
+        #endif
+    }
+}
 
 void update_count(fpsHandle* handle) {
     struct timespec now;
@@ -1634,6 +1710,8 @@ static void lidar_device_callback(const lidar_device_info_t* device, bool attach
                 #else
                     ROS_INFO("Relocalization map set successfully");
                 #endif
+                // Load map calibration (T_real_map_device_map) if available
+                loadMapCalibration();
             } else {
                 #ifdef ROS2
                     RCLCPP_ERROR(rclcpp::get_logger("device_cb"), "Relocalization map path set fail");
